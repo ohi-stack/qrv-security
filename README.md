@@ -1,143 +1,129 @@
 # QR-V™ Security
 
-Security architecture, threat models, production-hardening requirements, responsible disclosure, audit controls, issuer trust, and cryptographic verification standards for the QR-V™ Global Verification Network.
+Security architecture, threat models, production-hardening requirements, issuer trust, and cryptographic verification standards for the QR-V™ Global Verification Network.
 
-## Security Objectives
+## Production trust boundary
 
-QR-V must preserve:
+The consolidated runtime uses two active nodes:
 
-- authenticity of registry-backed records;
-- integrity of canonical payloads;
-- authorization of issuers and operators;
-- confidentiality of restricted and private records;
-- availability of verification services;
-- traceability of issuance, verification, mutation, and revocation events.
+```text
+qrv.network
+  public platform, verification UI, issuer UI, docs, registry UI
+      ↓ server-to-server
+api.qrv.network
+  API, PostgreSQL access, registry mutation, verification state, audit
+      ↓
+PostgreSQL / Google Cloud SQL
+```
 
-## Primary Threats
+### Mandatory boundary rules
+
+- `qrv.network` must not receive `DATABASE_URL`.
+- `api.qrv.network` is the only application node with database credentials.
+- `QRV_PLATFORM_API_KEY` is server-to-server and must never be exposed to browser JavaScript.
+- Write operations fail closed when authorization is missing.
+- CORS on the API should allow only explicitly approved origins, starting with `https://qrv.network`.
+- Legacy subdomains are compatibility redirects, not independent trust boundaries.
+
+## Primary threats
 
 - QR-code cloning or visual replacement;
 - malicious URL substitution;
 - forged certificates or product records;
-- unauthorized issuer creation;
-- stolen issuer API keys or sessions;
+- unauthorized issuer access;
+- stolen platform or issuer credentials;
 - unauthorized record mutation or revocation;
 - signature or public-key substitution;
 - replay of stale verification responses;
 - registry enumeration and privacy leakage;
-- SQL injection and unsafe query composition;
-- denial of service and abusive scanning;
+- SQL injection;
+- denial of service;
 - compromised deployment credentials;
-- public/private environment confusion;
-- silent fallback to demo or cached data.
+- silent fallback to demo data.
 
-## Mandatory Production Controls
+## Current consolidated controls
 
-### Identity and Access
+The current two-node implementation provides:
 
-- JWT or secure server-side sessions for authenticated portals.
-- API keys scoped to one issuer and specific operations.
-- Role-based access control for platform and issuer users.
-- Multi-factor authentication for platform administrators.
-- Immediate token and key revocation capability.
-- Separate production, staging, and development credentials.
+- HTTPS-ready server separation;
+- strict API CORS configuration;
+- server-side write authorization;
+- HttpOnly issuer session cookies on the platform node;
+- issuer writes proxied server-to-server;
+- parameterized SQL;
+- public verification rate limiting;
+- health/readiness separation;
+- create, verify, and revoke audit events;
+- deterministic public states: `VERIFIED`, `REVOKED`, `EXPIRED`, `NOT_FOUND`;
+- fail-closed issuer access when required secrets are missing.
 
-### Registry and API
+## Required hardening before enterprise multi-tenant launch
 
-- Parameterized SQL only.
-- Schema validation for every external request.
-- Idempotency keys for issuance and other retryable mutations.
-- Optimistic or explicit concurrency controls for lifecycle changes.
-- Append-oriented audit logs.
-- Strict CORS allowlist.
-- Rate limiting by IP, issuer, API key, and operation.
-- Request IDs propagated across services.
+The consolidated `/issuer` access-code flow is suitable only as a controlled pilot gate. Replace or extend it before multi-tenant commercial deployment with:
 
-### Cryptography
+- individual issuer accounts;
+- Argon2id or bcrypt password hashing;
+- MFA for privileged users;
+- issuer-scoped RBAC;
+- issuer-scoped API keys;
+- session rotation and revocation;
+- login throttling and lockout policy;
+- organization/team boundaries;
+- administrative approval workflow;
+- audit attribution to individual actors.
 
-- SHA-256 for canonical record hashing.
-- Ed25519 for issuer signatures.
-- Canonical JSON serialization before hashing and signing.
-- Private keys stored outside repositories and application logs.
-- Public-key versioning and rotation support.
-- Verification results must identify the key version used.
-- Signature or hash failure must never return `VERIFIED`.
+## Cryptographic requirements
 
-### Availability and Fail-Safe Behavior
+QRVP-1 requires:
 
-- `/healthz` confirms process health without requiring the database.
+- canonical JSON serialization;
+- SHA-256 record hashing;
+- Ed25519 issuer signatures;
+- private keys stored outside repositories and logs;
+- issuer public-key versioning and rotation;
+- deterministic signature validation during verification.
+
+The consolidated API currently exposes hash presence and does **not** claim successful signature validation unless signing keys are configured. Full Ed25519 issuer signing remains a production-hardening gate and must be completed before claiming full QRVP-1 cryptographic verification compliance.
+
+## Availability and fail-safe behavior
+
+- `/healthz` confirms process health without requiring PostgreSQL.
 - `/readyz` confirms required dependencies.
-- Dependency failure returns `UNAVAILABLE`, never `NOT_FOUND` or `VERIFIED`.
-- Revocation and issuer-status checks must not rely on stale cache.
-- Public pages must never expose raw stack traces.
+- dependency failure must not return `VERIFIED` or `NOT_FOUND`;
+- revoked state must not be served from stale cache;
+- public pages must not expose stack traces or secrets.
 
-### Data Protection
+## Database security
 
-QRVP-1 privacy modes:
+The historical deployment record identified temporary `0.0.0.0/0` database access. That must not remain as the long-term production rule. Restrict ingress to approved infrastructure where feasible, require TLS, rotate credentials after network changes, and maintain tested backups.
 
-- `public` — approved public fields;
-- `restricted` — reduced metadata;
-- `private` — validity result and minimum issuer/record context only.
+## Audit events
 
-Logs must not contain private payloads, secrets, full tokens, or signing keys.
-
-## Deterministic Security States
+At minimum:
 
 ```text
-VERIFIED
-REVOKED
-EXPIRED
-NOT_FOUND
-INVALID_FORMAT
-INVALID_SIGNATURE
-SUSPENDED_ISSUER
-UNAVAILABLE
+CREATE
+VERIFY
+REVOKE
+issuer_login
+issuer_login_failed
+api_key_used
+admin_override
+signing_key_rotated
 ```
 
-## Critical Infrastructure Correction
+Audit records should include request ID, actor, issuer, QRVID, operation, result, UTC timestamp, and structured metadata where applicable.
 
-The historical deployment record identified temporary database access using `0.0.0.0/0`. This must not remain in production. Restrict database ingress to approved application infrastructure, use TLS, rotate credentials after access changes, and prefer private or controlled connectivity where operationally available.
+## Security release gate
 
-## Audit Events
+Do not claim full production security readiness until:
 
-At minimum, record:
-
-- `issuer_login`
-- `issuer_login_failed`
-- `issuer_created`
-- `issuer_approved`
-- `issuer_suspended`
-- `registry_create`
-- `registry_verify`
-- `registry_update`
-- `registry_revoke`
-- `api_key_created`
-- `api_key_revoked`
-- `signing_key_rotated`
-- `admin_override`
-
-## Responsible Disclosure
-
-Security reports should include:
-
-- affected service and URL;
-- reproduction steps;
-- expected and observed behavior;
-- potential impact;
-- request IDs or timestamps;
-- proof that avoids accessing unrelated records.
-
-Do not include live secrets, unnecessary personal data, destructive exploit payloads, or public disclosure before a reasonable remediation window.
-
-## Security Release Gate
-
-A release cannot be marked production-ready until:
-
-- authentication and authorization tests pass;
+- multi-tenant issuer authentication is implemented;
+- issuer-scoped authorization tests pass;
+- Ed25519 signature validation is active;
 - invalid signatures fail closed;
-- private fields are filtered;
-- revoked records cannot be cached as verified;
-- rate limiting is active;
+- restricted/private data is filtered;
 - dependency failure returns a safe unavailable state;
 - secrets scanning and dependency audit pass;
-- backup and rollback procedures are documented;
-- the complete issue → verify → revoke lifecycle is audit logged.
+- database ingress is hardened;
+- issue → verify → revoke is fully audit logged.
