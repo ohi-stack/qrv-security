@@ -4,26 +4,42 @@ Security architecture, threat models, production-hardening requirements, issuer 
 
 ## Production trust boundary
 
-The consolidated runtime uses two active nodes:
+QR-V Production Architecture v1.0 uses exactly two active runtime nodes:
 
 ```text
 qrv.network
-  public platform, verification UI, issuer UI, docs, registry UI
-      ↓ server-to-server
+  public platform, verification UI, issuer UI, docs, registry/explorer UI
+      ↓ authenticated server-to-server calls
 api.qrv.network
-  API, PostgreSQL access, registry mutation, verification state, audit
+  trusted API, canonical persistence, registry mutation, verification state,
+  issuer authorization, cryptographic processing, audit, rate limiting
       ↓
-PostgreSQL / Google Cloud SQL
+canonical QR-V registry datastore
 ```
+
+Legacy QR-V subdomains are compatibility aliases only. They are not separate trust boundaries.
 
 ### Mandatory boundary rules
 
 - `qrv.network` must not receive `DATABASE_URL`.
-- `api.qrv.network` is the only application node with database credentials.
+- `qrv.network` must not receive `SUPABASE_SECRET_KEY`.
+- `qrv.network` must not receive signing private keys, webhook secrets, payment-provider secrets, or database-admin credentials.
+- `api.qrv.network` is the only production application node allowed to own canonical registry credentials.
 - `QRV_PLATFORM_API_KEY` is server-to-server and must never be exposed to browser JavaScript.
 - Write operations fail closed when authorization is missing.
-- CORS on the API should allow only explicitly approved origins, starting with `https://qrv.network`.
-- Legacy subdomains are compatibility redirects, not independent trust boundaries.
+- CORS on the API must allow only explicitly approved origins, starting with `https://qrv.network`.
+- Database secrets, issuer signing keys, webhook secrets, privileged API keys, and server-side billing secrets belong on the API node only.
+- Redirect-only legacy hostnames must use canonical HTTP 308 redirects and must not host duplicate writable applications.
+
+## Single-authority datastore rule
+
+QR-V must have exactly one writable canonical registry authority.
+
+The current production contract is PostgreSQL / managed PostgreSQL through `DATABASE_URL` on `api.qrv.network`.
+
+Supabase is permitted only as an intentional replacement persistence adapter. If adopted, `SUPABASE_URL` and `SUPABASE_SECRET_KEY` remain server-side on the API node, and the old datastore must not remain a competing writable source of truth.
+
+Split-brain registry state is a critical integrity failure.
 
 ## Primary threats
 
@@ -39,7 +55,9 @@ PostgreSQL / Google Cloud SQL
 - SQL injection;
 - denial of service;
 - compromised deployment credentials;
-- silent fallback to demo data.
+- silent fallback to demo data;
+- split-brain state between multiple writable datastores;
+- legacy-host routing to an incorrect application.
 
 ## Current consolidated controls
 
@@ -54,8 +72,9 @@ The current two-node implementation provides:
 - public verification rate limiting;
 - health/readiness separation;
 - create, verify, and revoke audit events;
-- deterministic public states: `VERIFIED`, `REVOKED`, `EXPIRED`, `NOT_FOUND`;
-- fail-closed issuer access when required secrets are missing.
+- deterministic public baseline states: `VERIFIED`, `REVOKED`, `EXPIRED`, `NOT_FOUND`;
+- fail-closed issuer access when required secrets are missing;
+- HTTP 308 legacy-host redirects on the platform node.
 
 ## Required hardening before enterprise multi-tenant launch
 
@@ -83,19 +102,54 @@ QRVP-1 requires:
 - issuer public-key versioning and rotation;
 - deterministic signature validation during verification.
 
-The consolidated API currently exposes hash presence and does **not** claim successful signature validation unless signing keys are configured. Full Ed25519 issuer signing remains a production-hardening gate and must be completed before claiming full QRVP-1 cryptographic verification compliance.
+SHA-256 integrity support is active in the current consolidated implementation. Full Ed25519 issuer signing remains a production gate.
+
+Do not claim full issuer-signed QRVP-1 cryptographic verification compliance until all of the following are operational end-to-end:
+
+```text
+issuer key generation / custody
+→ record signing
+→ signature persistence
+→ issuer public-key lookup
+→ signature verification
+→ key rotation/versioning
+→ INVALID_SIGNATURE fail-closed handling
+```
+
+## Production verification-state target
+
+The current baseline implementation returns:
+
+```text
+VERIFIED
+REVOKED
+EXPIRED
+NOT_FOUND
+```
+
+The production security target must also distinguish, where applicable:
+
+```text
+INVALID_FORMAT
+INVALID_SIGNATURE
+SUSPENDED_ISSUER
+UNAVAILABLE
+```
+
+Dependency failures must never be mislabeled as `NOT_FOUND` or `VERIFIED`.
 
 ## Availability and fail-safe behavior
 
-- `/healthz` confirms process health without requiring PostgreSQL.
-- `/readyz` confirms required dependencies.
+- `/healthz` confirms process health without requiring the registry datastore.
+- `/readyz` confirms required dependencies and canonical registry access.
 - dependency failure must not return `VERIFIED` or `NOT_FOUND`;
 - revoked state must not be served from stale cache;
-- public pages must not expose stack traces or secrets.
+- public pages must not expose stack traces or secrets;
+- overall public status must not claim full operational readiness when the API node is misrouted, unavailable, or failing acceptance.
 
 ## Database security
 
-The historical deployment record identified temporary `0.0.0.0/0` database access. That must not remain as the long-term production rule. Restrict ingress to approved infrastructure where feasible, require TLS, rotate credentials after network changes, and maintain tested backups.
+The historical deployment record identified temporary `0.0.0.0/0` database access. That must not remain as the long-term production rule. Restrict ingress to approved infrastructure where feasible, require TLS, rotate credentials after network changes, maintain tested backups, and test restoration.
 
 ## Audit events
 
@@ -118,7 +172,8 @@ Audit records should include request ID, actor, issuer, QRVID, operation, result
 
 Do not claim full production security readiness until:
 
-- multi-tenant issuer authentication is implemented;
+- `api.qrv.network` is mapped to the canonical API application and passes `/healthz` and `/readyz`;
+- multi-tenant issuer authentication is implemented for general enterprise use;
 - issuer-scoped authorization tests pass;
 - Ed25519 signature validation is active;
 - invalid signatures fail closed;
@@ -126,4 +181,6 @@ Do not claim full production security readiness until:
 - dependency failure returns a safe unavailable state;
 - secrets scanning and dependency audit pass;
 - database ingress is hardened;
-- issue → verify → revoke is fully audit logged.
+- backup/restore is tested;
+- issue → verify → revoke is fully audit logged;
+- legacy subdomains resolve only through canonical redirect behavior.
